@@ -407,13 +407,17 @@ export async function handleMetaCommand(
       const page = bm.getPage();
       const tabs = bm.getTabCount();
       const mode = bm.getConnectionMode();
-      return [
+      const lines = [
         `Status: healthy`,
         `Mode: ${mode}`,
         `URL: ${page.url()}`,
         `Tabs: ${tabs}`,
         `PID: ${process.pid}`,
-      ].join('\n');
+      ];
+      if (bm.getIsPersistentMode()) {
+        lines.push(`Profile: ${process.env.BROWSE_PROFILE_DIR || 'unknown'}`);
+      }
+      return lines.join('\n');
     }
 
     case 'url': {

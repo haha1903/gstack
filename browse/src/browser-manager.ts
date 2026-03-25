@@ -197,7 +197,15 @@ export class BrowserManager {
   // pipeline so process supervisors (gbrowser's gbd) read the right signal.
   public onDisconnect: ((exitCode?: number) => void | Promise<void>) | null = null;
 
+  // ─── Persistent Profile Mode ──────────────────────────────
+  private isPersistentMode: boolean = false;
+  private persistentProfileDir: string | null = null;
+
   getConnectionMode(): 'launched' | 'headed' { return this.connectionMode; }
+
+  getIsPersistentMode(): boolean {
+    return this.isPersistentMode;
+  }
 
   // ─── Watch Mode Methods ─────────────────────────────────
   isWatching(): boolean { return this.watching; }
@@ -282,13 +290,12 @@ export class BrowserManager {
     }
   }
 
-  async launch() {
-    // ─── Extension Support ────────────────────────────────────
-    // BROWSE_EXTENSIONS_DIR points to an unpacked Chrome extension directory.
-    // Extensions only work in headed mode, so we use an off-screen window.
+  private async buildLaunchConfig() {
     const extensionsDir = process.env.BROWSE_EXTENSIONS_DIR;
+    const channel = process.env.BROWSE_CHANNEL;
     const { STEALTH_LAUNCH_ARGS } = await import('./stealth');
     const launchArgs: string[] = [...STEALTH_LAUNCH_ARGS];
+    const ignoreArgs: string[] = [];
     let useHeadless = true;
 
     // Docker/CI/root: Chromium sandbox requires unprivileged user namespaces which
@@ -306,10 +313,67 @@ export class BrowserManager {
         '--window-position=-9999,-9999',
         '--window-size=1,1',
       );
-      useHeadless = false; // extensions require headed mode; off-screen window simulates headless
+      useHeadless = false;
       console.log(`[browse] Extensions loaded from: ${extensionsDir}`);
     }
 
+    return { channel, launchArgs, ignoreArgs, useHeadless };
+  }
+
+  async launch() {
+    const { channel, launchArgs, ignoreArgs, useHeadless } = await this.buildLaunchConfig();
+    const profileDir = process.env.BROWSE_PROFILE_DIR;
+
+    // ─── Persistent Profile Mode (BROWSE_PROFILE_DIR) ─────────
+    if (profileDir) {
+      this.isPersistentMode = true;
+      this.persistentProfileDir = profileDir;
+      ignoreArgs.push('--disable-extensions', '--use-mock-keychain', '--password-store=basic',
+        '--disable-component-extensions-with-background-pages');
+      console.log(`[browse] Persistent profile: ${profileDir}`);
+
+      this.context = await chromium.launchPersistentContext(profileDir, {
+        headless: useHeadless,
+        chromiumSandbox: shouldEnableChromiumSandbox(),
+        viewport: { width: 1280, height: 720 },
+        ...(this.customUserAgent ? { userAgent: this.customUserAgent } : {}),
+        ...(channel ? { channel } : {}),
+        ...(launchArgs.length > 0 ? { args: launchArgs } : {}),
+        ...(this.proxyConfig ? { proxy: this.proxyConfig } : {}),
+        ignoreDefaultArgs: ignoreArgs,
+      });
+
+      this.browser = this.context.browser();
+      const underlying = this.browser;
+      if (underlying) {
+        underlying.on('disconnected', () => {
+          void handleChromiumDisconnect(underlying);
+        });
+      }
+
+      if (Object.keys(this.extraHeaders).length > 0) {
+        await this.context.setExtraHTTPHeaders(this.extraHeaders);
+      }
+
+      const { applyStealth } = await import('./stealth');
+      await applyStealth(this.context);
+
+      const pages = this.context.pages();
+      if (pages.length > 0) {
+        for (const page of pages) {
+          const id = this.nextTabId++;
+          this.pages.set(id, page);
+          this.tabSessions.set(id, new TabSession(page));
+          this.wirePageEvents(page);
+        }
+        this.activeTabId = [...this.pages.keys()][0];
+      } else {
+        await this.newTab();
+      }
+      return;
+    }
+
+    // ─── Standard Mode ───────────────────────────────────────
     this.browser = await chromium.launch({
       headless: useHeadless,
       // On Windows, Chromium's sandbox fails when the server is spawned through
@@ -318,6 +382,7 @@ export class BrowserManager {
       // on Linux root/CI/container, where the sandbox requires unprivileged user
       // namespaces that aren't available.
       chromiumSandbox: shouldEnableChromiumSandbox(),
+      ...(channel ? { channel } : {}),
       ...(launchArgs.length > 0 ? { args: launchArgs } : {}),
       ...(this.proxyConfig ? { proxy: this.proxyConfig } : {}),
     });
@@ -677,9 +742,16 @@ export class BrowserManager {
   }
 
   async close() {
-    if (this.browser || (this.connectionMode === 'headed' && this.context)) {
+    if (this.isPersistentMode && this.context) {
+      const underlying = this.context.browser();
+      if (underlying) underlying.removeAllListeners('disconnected');
+      await Promise.race([
+        this.context.close(),
+        new Promise(resolve => setTimeout(resolve, 5000)),
+      ]).catch(() => {});
+      this.context = null;
+    } else if (this.browser || (this.connectionMode === 'headed' && this.context)) {
       if (this.connectionMode === 'headed') {
-        // Headed/persistent context mode: close the context (which closes the browser)
         this.intentionalDisconnect = true;
         if (this.browser) this.browser.removeAllListeners('disconnected');
         await Promise.race([
@@ -687,7 +759,6 @@ export class BrowserManager {
           new Promise(resolve => setTimeout(resolve, 5000)),
         ]).catch(() => {});
       } else {
-        // Launched mode: close the browser we spawned
         this.browser.removeAllListeners('disconnected');
         await Promise.race([
           this.browser.close(),
@@ -700,7 +771,13 @@ export class BrowserManager {
 
   /** Health check — verifies Chromium is connected AND responsive */
   async isHealthy(): Promise<boolean> {
-    if (!this.browser || !this.browser.isConnected()) return false;
+    if (this.isPersistentMode) {
+      if (!this.context) return false;
+      const underlying = this.context.browser();
+      if (underlying && !underlying.isConnected()) return false;
+    } else if (!this.browser || !this.browser.isConnected()) {
+      return false;
+    }
     try {
       const page = this.pages.get(this.activeTabId);
       if (!page) return true; // connected but no pages — still healthy
@@ -1238,6 +1315,9 @@ export class BrowserManager {
    * Falls back to a clean slate on any failure.
    */
   async recreateContext(): Promise<string | null> {
+    if (this.isPersistentMode) {
+      return 'Cannot recreate context in persistent profile mode. Restart the server to apply changes.';
+    }
     if (this.connectionMode === 'headed') {
       throw new Error('Cannot recreate context in headed mode. Use disconnect first.');
     }
@@ -1371,6 +1451,63 @@ export class BrowserManager {
     if (this.connectionMode === 'headed' || this.isHeaded) {
       return `HANDOFF: Already in headed mode at ${this.getCurrentUrl()}`;
     }
+
+    // Persistent mode: close headless context, relaunch headed with same profile
+    if (this.isPersistentMode) {
+      if (!this.context) throw new Error('Browser not launched');
+      const currentUrl = this.getCurrentUrl();
+
+      for (const page of this.pages.values()) await page.close().catch(() => {});
+      this.pages.clear();
+      const underlying = this.context.browser();
+      if (underlying) underlying.removeAllListeners('disconnected');
+      await this.context.close().catch(() => {});
+      this.context = null;
+
+      const { channel, launchArgs, ignoreArgs } = this.buildLaunchConfig();
+      ignoreArgs.push('--disable-extensions', '--use-mock-keychain', '--password-store=basic',
+        '--disable-component-extensions-with-background-pages');
+      try {
+        this.context = await chromium.launchPersistentContext(this.persistentProfileDir!, {
+          headless: false,
+          chromiumSandbox: process.platform !== 'win32',
+          viewport: { width: 1280, height: 720 },
+          ...(this.customUserAgent ? { userAgent: this.customUserAgent } : {}),
+          ...(channel ? { channel } : {}),
+          ...(launchArgs.length > 0 ? { args: launchArgs } : {}),
+          ignoreDefaultArgs: ignoreArgs,
+        });
+        const newUnderlying = this.context.browser();
+        if (newUnderlying) {
+          newUnderlying.on('disconnected', () => {
+            console.error('[browse] FATAL: Browser process crashed. Server exiting.');
+            process.exit(1);
+          });
+        }
+        const pages = this.context.pages();
+        for (const page of pages) {
+          const id = this.nextTabId++;
+          this.pages.set(id, page);
+          this.wirePageEvents(page);
+        }
+        if (this.pages.size === 0) await this.newTab();
+        this.activeTabId = [...this.pages.keys()][0];
+        this.isHeaded = true;
+        return [`HANDOFF: Browser opened at ${currentUrl}`, `MESSAGE: ${message}`,
+          `STATUS: Waiting for user. Run 'resume' when done.`].join('\n');
+      } catch (err: unknown) {
+        try {
+          this.context = await chromium.launchPersistentContext(this.persistentProfileDir!, {
+            headless: true, chromiumSandbox: process.platform !== 'win32',
+            ...(channel ? { channel } : {}), ignoreDefaultArgs: ignoreArgs,
+          });
+          await this.newTab();
+        } catch { /* total failure */ }
+        const msg = err instanceof Error ? err.message : String(err);
+        return `ERROR: Persistent handoff failed — ${msg}. Headless browser recovered.`;
+      }
+    }
+
     if (!this.browser || !this.context) {
       throw new Error('Browser not launched');
     }
