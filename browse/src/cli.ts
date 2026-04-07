@@ -225,7 +225,11 @@ async function startServer(extraEnv?: Record<string, string>): Promise<ServerSta
   // the spawning CLI. Defaults to the current process PID (watchdog active).
   // Parse as int so stray whitespace ("0\n") still opts out — matches the
   // server's own parseInt at server.ts:760.
-  const parentPid = parseInt(process.env.BROWSE_PARENT_PID || '', 10) === 0 ? '0' : String(process.pid);
+  // BROWSE_PROFILE_DIR implies persistent mode → server must outlive each CLI
+  // invocation to keep the SSO session alive (same pattern as pair-agent).
+  const parentPid = (parseInt(process.env.BROWSE_PARENT_PID || '', 10) === 0 || process.env.BROWSE_PROFILE_DIR)
+    ? '0'
+    : String(process.pid);
 
   if (IS_WINDOWS && NODE_SERVER_SCRIPT) {
     // Windows: Bun.spawn() + proc.unref() doesn't truly detach on Windows —
